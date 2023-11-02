@@ -126,6 +126,7 @@ def main() -> None:
                 metavar="PARAMETERS_JSON",
             )
             parser.add_argument("-o", "--output", help="dump messages to file", metavar="OUTPUT")
+            parser.add_argument("--arg", type=int, default=0, help="show arg detail info。 0 none 1 type 2 value")
             self._profile_builder = pb
 
         def _usage(self) -> str:
@@ -138,6 +139,7 @@ def main() -> None:
             self._decorate: bool = options.decorate
             self._output: Optional[OutputFile] = None
             self._output_path: str = options.output
+            self._arg_value_type: int = options.arg
 
             self._init_scripts = []
             for path in options.init_session:
@@ -164,10 +166,11 @@ def main() -> None:
                 self._output = OutputFile(self._output_path)
 
             stage = "early" if self._target[0] == "file" else "late"
-
+            file_repo = FileRepository(self._reactor, self._decorate)
+            file_repo._arg_value_type = self._arg_value_type
             self._tracer = Tracer(
                 self._reactor,
-                FileRepository(self._reactor, self._decorate),
+                file_repo,
                 self._profile,
                 self._init_scripts,
                 log_handler=self._log,
@@ -459,9 +462,21 @@ class TraceTarget:
         self.identifier = identifier
         self.flavor = flavor
         self.scope = scope
+        self.tr_arg_obj = []
+        self.tr_ret_obj = None
+        self.tr_sel = None
         if isinstance(name, list):
             self.name = name[0]
             self.display_name = name[1]
+            if len(name) == 3:
+                tr_arg_obj = []
+                argInfo = name[2].get("argInfo", {})
+                for k, v in argInfo.items():
+                    if v:
+                        tr_arg_obj.append(int(k))
+                self.tr_arg_obj = list(set(tr_arg_obj))
+                self.tr_ret_obj = name[2].get("retType", False)
+                self.tr_sel = name[2].get("sel", "")
         else:
             self.name = name
             self.display_name = name
@@ -476,6 +491,7 @@ class Repository:
         self._on_load_callback: Optional[Callable[[TraceTarget, str, str], None]] = None
         self._on_update_callback: Optional[Callable[[TraceTarget, str, str], None]] = None
         self._decorate = False
+        self._arg_value_type = False
 
     def ensure_handler(self, target: TraceTarget):
         raise NotImplementedError("not implemented")
@@ -511,6 +527,7 @@ class Repository:
             return self._create_stub_native_handler(target, decorate)
 
     def _create_stub_native_handler(self, target: TraceTarget, decorate: bool) -> str:
+        arg_decl_str = ""
         if target.flavor == "objc":
             state = {"index": 2}
 
@@ -520,7 +537,55 @@ class Repository:
                 state["index"] = index + 1
                 return r
 
+            arg_value_type = self._arg_value_type
             log_str = "`" + re.sub(r":", objc_arg, target.display_name) + "`"
+            if len(target.tr_arg_obj) > 0:
+                arg_decls = []
+                state = {"index": 2}
+
+                def objc_arg_obj(m):
+                    index = state["index"]
+                    arg_index = index - 2
+
+                    r = ":${arg%d} " % arg_index
+                    arg_del = (
+                        "const arg%(arg_index)s_v = args[%(index)s]; let arg%(arg_index)s = `${arg%(arg_index)s_v}`;"
+                        % {
+                            "arg_index": arg_index,
+                            "index": index,
+                        }
+                    )
+                    if arg_value_type and arg_index in target.tr_arg_obj:
+                        if arg_value_type == 1:
+                            arg_del = (
+                                "%(arg_del)s\n      if (parseInt(arg%(arg_index)s) > 0xfffff) { const arg%(arg_index)s_obj = ObjC.api.object_getClassName(arg%(arg_index)s_v).readUtf8String(); arg%(arg_index)s = `${arg%(arg_index)s}(${arg%(arg_index)s_obj})` };"
+                                % {
+                                    "arg_index": arg_index,
+                                    "arg_del": arg_del,
+                                }
+                            )
+                        elif arg_value_type == 2:
+                            arg_del = (
+                                "%(arg_del)s\n      if (parseInt(arg%(arg_index)s) > 0xfffff) { const arg%(arg_index)s_obj = new ObjC.Object(arg%(arg_index)s_v).toString(); arg%(arg_index)s = `${arg%(arg_index)s}(${arg%(arg_index)s_obj})` };"
+                                % {
+                                    "arg_index": arg_index,
+                                    "arg_del": arg_del,
+                                }
+                            )
+                    arg_decls.append(arg_del)
+                    state["index"] = index + 1
+                    return r
+
+                log_str = "`" + re.sub(r":", objc_arg_obj, target.display_name) + "`"
+                arg_decls = ["      " + x for x in arg_decls]
+                arg_decl_str = "\n\n".join(arg_decls)
+                if target.tr_sel:
+                    # add sel check
+                    # `ObjC.api.sel_getName(args[1]).readCString()` no stable
+                    arg_decl_str = "      if (`${args[1]}` != '%s') { return ;}\n%s" % (
+                        target.tr_sel,
+                        arg_decl_str,
+                    )
             if log_str.endswith("} ]`"):
                 log_str = log_str[:-3] + "]`"
         elif target.flavor == "swift":
@@ -623,6 +688,9 @@ class Repository:
    * use "this" which is an object for keeping state local to an invocation.
    */
   onEnter(log, args, state) {
+      // new ObjC.Object().toString()
+%(arg_decl_str)s
+
     log(%(log_str)s);
   },
 
@@ -642,6 +710,7 @@ class Repository:
 """ % {
             "display_name": target.display_name,
             "log_str": log_str,
+            "arg_decl_str": arg_decl_str,
         }
 
     def _create_stub_java_handler(self, target: TraceTarget, decorate) -> str:
@@ -733,6 +802,10 @@ class FileRepository(Repository):
         if os.path.isfile(handler_file):
             with codecs.open(handler_file, "r", "utf-8") as f:
                 handler = f.read()
+            if target.tr_sel:
+                handler = re.sub(r"\[1\]}` != '0x[\da-fA-F]+", "[1]}` != '" + str(target.tr_sel), handler)
+            else:
+                handler = re.sub(r"\n *if \(`\$.*", "", handler)
             self._notify_load(target, handler, handler_file)
 
         if handler is None:

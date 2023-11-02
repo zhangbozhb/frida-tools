@@ -1,3 +1,101 @@
+interface MethodTypeSignature {
+    argInfo: { [key: number]: boolean };
+    retType: boolean;
+    sel?: string;
+}
+
+interface MethodSignature extends MethodTypeSignature {
+    name: string;
+    className: string;
+    fullName: string;
+}
+
+const runtime = (function () {
+    // 运行时 api
+    const _api_ext: { [name: string]: any } = {};
+    const runtime_api_defs: { [key: string]: any } = {
+        method_getNumberOfArguments: ["uint", ["pointer"]],
+        method_copyArgumentType: ["pointer", ["pointer", "int"]],
+        method_copyReturnType: ["pointer", ["pointer"]],
+    };
+    const runtime_api = new Proxy(ObjC.api, {
+        get(target, p, receiver) {
+            const ps = p as string;
+            let tp = target[ps];
+            if (tp) {
+                return tp;
+            }
+            let defs = runtime_api_defs[ps];
+            if (defs) {
+                const api_address = Module.getExportByName(
+                    "libobjc.A.dylib",
+                    ps
+                );
+                const defaultInvocationOptions = {
+                    exceptions: "propagate" as ExceptionsBehavior,
+                };
+                const funcPtr = new NativeFunction(
+                    api_address,
+                    defs[0],
+                    defs[1],
+                    defaultInvocationOptions
+                );
+                _api_ext[ps] = funcPtr;
+                return funcPtr;
+            }
+        },
+    });
+
+    // 是否是 OC类型
+    const isObjcType = (typeStr: string) => {
+        // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjCRuntimeGuide/Articles/ocrtTypeEncodings.html#//apple_ref/doc/uid/TP40008048-CH100-SW1
+        https: while (typeStr && /^[rnNoORV]/.test(typeStr)) {
+            typeStr = typeStr.substring(1);
+        }
+        return /^[@#]$/.test(typeStr);
+    };
+
+    return {
+        api: runtime_api,
+        // 获取函数信息
+        methodFromAPI(api: ApiResolverMatch) {
+            const { name } = api;
+            const [className, mName] = name
+                .substring(2, name.length - 1)
+                .split(" ", 2);
+            const methodName = `${name[0]} ${mName}`;
+            const cls = ObjC.classes[className];
+            const method = cls[methodName] as ObjC.ObjectMethod;
+            return { method, className, methodName };
+        },
+        isObjcType,
+        // 获取函数 参数返回值签名
+        methdTypeSignatureOf(methodHandle: NativePointer) {
+            const numberOfArg =
+                runtime_api.method_getNumberOfArguments(methodHandle);
+            const argInfo: { [key: number]: boolean } = {};
+            for (let argIndex = 2; argIndex < numberOfArg; argIndex++) {
+                const argTypePrt = runtime_api.method_copyArgumentType(
+                    methodHandle,
+                    argIndex
+                );
+                const argType = argTypePrt.readUtf8String();
+                runtime_api.free(argTypePrt);
+                if (isObjcType(argType)) {
+                    argInfo[argIndex - 2] = true;
+                }
+            }
+            const retTypePtr = runtime_api.method_copyReturnType(methodHandle);
+            const retType = isObjcType(retTypePtr.readUtf8String());
+            const signature: MethodTypeSignature = {
+                argInfo: argInfo,
+                retType: retType,
+            };
+            return signature;
+        },
+    };
+})();
+
 class Agent {
     private handlers = new Map<TraceTargetId, TraceHandler>();
     private stackDepth = new Map<ThreadId, number>();
@@ -12,7 +110,12 @@ class Agent {
     private cachedObjcResolver: ApiResolver | null = null;
     private cachedSwiftResolver: ApiResolver | null = null;
 
-    init(stage: Stage, parameters: TraceParameters, initScripts: InitScript[], spec: TraceSpec) {
+    init(
+        stage: Stage,
+        parameters: TraceParameters,
+        initScripts: InitScript[],
+        spec: TraceSpec
+    ) {
         const g = global as any as TraceScriptGlobals;
         g.stage = stage;
         g.parameters = parameters;
@@ -22,14 +125,16 @@ class Agent {
             try {
                 (1, eval)(script.source);
             } catch (e: any) {
-                throw new Error(`Unable to load ${script.filename}: ${e.stack}`);
+                throw new Error(
+                    `Unable to load ${script.filename}: ${e.stack}`
+                );
             }
         }
 
-        this.start(spec).catch(e => {
+        this.start(spec).catch((e) => {
             send({
                 type: "agent:error",
-                message: e.message
+                message: e.message,
             });
         });
     }
@@ -52,7 +157,7 @@ class Agent {
     private async start(spec: TraceSpec) {
         const plan: TracePlan = {
             native: new Map<NativeId, NativeTarget>(),
-            java: []
+            java: [],
         };
 
         const javaEntries: [TraceSpecOperation, TraceSpecPattern][] = [];
@@ -126,7 +231,9 @@ class Agent {
                         }
                     }
 
-                    this.traceJavaTargets(plan.java).then(resolve).catch(reject);
+                    this.traceJavaTargets(plan.java)
+                        .then(resolve)
+                        .catch(reject);
                 });
             });
         } else {
@@ -140,13 +247,13 @@ class Agent {
         }
 
         send({
-            type: "agent:initialized"
+            type: "agent:initialized",
         });
 
         javaStartRequest.then(() => {
             send({
                 type: "agent:started",
-                count: this.handlers.size
+                count: this.handlers.size,
             });
         });
     }
@@ -186,7 +293,10 @@ class Agent {
         ]);
     }
 
-    private async traceNativeEntries(flavor: "c" | "objc" | "swift", groups: NativeTargetScopes) {
+    private async traceNativeEntries(
+        flavor: "c" | "objc" | "swift",
+        groups: NativeTargetScopes
+    ) {
         if (groups.size === 0) {
             return;
         }
@@ -197,12 +307,12 @@ class Agent {
             type: "handlers:get",
             flavor,
             baseId,
-            scopes
+            scopes,
         };
         for (const [name, items] of groups.entries()) {
             scopes.push({
                 name,
-                members: items.map(item => item[0])
+                members: items.map((item) => item[0]),
             });
             this.nextId += items.length;
         }
@@ -213,17 +323,20 @@ class Agent {
         for (const items of groups.values()) {
             for (const [name, address] of items) {
                 const id = baseId + offset;
-                const displayName = (typeof name === "string") ? name : name[1];
+                const displayName = typeof name === "string" ? name : name[1];
 
                 const handler = this.parseHandler(displayName, scripts[offset]);
                 this.handlers.set(id, handler);
 
                 try {
-                    Interceptor.attach(address, this.makeNativeListenerCallbacks(id, handler));
+                    Interceptor.attach(
+                        address,
+                        this.makeNativeListenerCallbacks(id, handler)
+                    );
                 } catch (e: any) {
                     send({
                         type: "agent:warning",
-                        message: `Skipping "${name}": ${e.message}`
+                        message: `Skipping "${name}": ${e.message}`,
                     });
                 }
 
@@ -239,16 +352,18 @@ class Agent {
             type: "handlers:get",
             flavor: "java",
             baseId,
-            scopes
+            scopes,
         };
         for (const group of groups) {
             for (const [className, { methods }] of group.classes.entries()) {
                 const classNameParts = className.split(".");
                 const bareClassName = classNameParts[classNameParts.length - 1];
-                const members: MemberName[] = Array.from(methods.keys()).map(bareName => [bareName, `${bareClassName}.${bareName}`]);
+                const members: MemberName[] = Array.from(methods.keys()).map(
+                    (bareName) => [bareName, `${bareClassName}.${bareName}`]
+                );
                 scopes.push({
                     name: className,
-                    members
+                    members,
                 });
                 this.nextId += members.length;
             }
@@ -256,24 +371,36 @@ class Agent {
 
         const { scripts }: HandlerResponse = await getHandlers(request);
 
-        return new Promise<void>(resolve => {
+        return new Promise<void>((resolve) => {
             Java.perform(() => {
                 let offset = 0;
                 for (const group of groups) {
                     const factory = Java.ClassFactory.get(group.loader as any);
 
-                    for (const [className, { methods }] of group.classes.entries()) {
+                    for (const [
+                        className,
+                        { methods },
+                    ] of group.classes.entries()) {
                         const C = factory.use(className);
 
                         for (const [bareName, fullName] of methods.entries()) {
                             const id = baseId + offset;
 
-                            const handler = this.parseHandler(fullName, scripts[offset]);
+                            const handler = this.parseHandler(
+                                fullName,
+                                scripts[offset]
+                            );
                             this.handlers.set(id, handler);
 
-                            const dispatcher: Java.MethodDispatcher = C[bareName];
+                            const dispatcher: Java.MethodDispatcher =
+                                C[bareName];
                             for (const method of dispatcher.overloads) {
-                                method.implementation = this.makeJavaMethodWrapper(id, method, handler);
+                                method.implementation =
+                                    this.makeJavaMethodWrapper(
+                                        id,
+                                        method,
+                                        handler
+                                    );
                             }
 
                             offset++;
@@ -286,7 +413,10 @@ class Agent {
         });
     }
 
-    private makeNativeListenerCallbacks(id: TraceTargetId, handler: TraceHandler): InvocationListenerCallbacks {
+    private makeNativeListenerCallbacks(
+        id: TraceTargetId,
+        handler: TraceHandler
+    ): InvocationListenerCallbacks {
         const agent = this;
 
         return {
@@ -295,11 +425,15 @@ class Agent {
             },
             onLeave(retval) {
                 agent.invokeNativeHandler(id, handler[1], this, retval, "<");
-            }
+            },
         };
     }
 
-    private makeJavaMethodWrapper(id: TraceTargetId, method: Java.Method, handler: TraceHandler): Java.MethodImplementation {
+    private makeJavaMethodWrapper(
+        id: TraceTargetId,
+        method: Java.Method,
+        handler: TraceHandler
+    ): Java.MethodImplementation {
         const agent = this;
 
         return function (...args: any[]) {
@@ -307,17 +441,35 @@ class Agent {
         };
     }
 
-    private handleJavaInvocation(id: TraceTargetId, method: Java.Method, handler: TraceHandler, instance: Java.Wrapper, args: any[]): any {
+    private handleJavaInvocation(
+        id: TraceTargetId,
+        method: Java.Method,
+        handler: TraceHandler,
+        instance: Java.Wrapper,
+        args: any[]
+    ): any {
         this.invokeJavaHandler(id, handler[0], instance, args, ">");
 
         const retval = method.apply(instance, args);
 
-        const replacementRetval = this.invokeJavaHandler(id, handler[1], instance, retval, "<");
+        const replacementRetval = this.invokeJavaHandler(
+            id,
+            handler[1],
+            instance,
+            retval,
+            "<"
+        );
 
-        return (replacementRetval !== undefined) ? replacementRetval : retval;
+        return replacementRetval !== undefined ? replacementRetval : retval;
     }
 
-    private invokeNativeHandler(id: TraceTargetId, callback: TraceEnterHandler | TraceLeaveHandler, context: InvocationContext, param: any, cutPoint: CutPoint) {
+    private invokeNativeHandler(
+        id: TraceTargetId,
+        callback: TraceEnterHandler | TraceLeaveHandler,
+        context: InvocationContext,
+        param: any,
+        cutPoint: CutPoint
+    ) {
         const timestamp = Date.now() - this.started;
         const threadId = context.threadId;
         const depth = this.updateDepth(threadId, cutPoint);
@@ -329,7 +481,13 @@ class Agent {
         callback.call(context, log, param, this.traceState);
     }
 
-    private invokeJavaHandler(id: TraceTargetId, callback: TraceEnterHandler | TraceLeaveHandler, instance: Java.Wrapper, param: any, cutPoint: CutPoint) {
+    private invokeJavaHandler(
+        id: TraceTargetId,
+        callback: TraceEnterHandler | TraceLeaveHandler,
+        instance: Java.Wrapper,
+        param: any,
+        cutPoint: CutPoint
+    ) {
         const timestamp = Date.now() - this.started;
         const threadId = Process.getCurrentThreadId();
         const depth = this.updateDepth(threadId, cutPoint);
@@ -345,7 +503,9 @@ class Agent {
             if (isJavaException) {
                 throw e;
             } else {
-                Script.nextTick(() => { throw e; });
+                Script.nextTick(() => {
+                    throw e;
+                });
             }
         }
     }
@@ -375,7 +535,7 @@ class Agent {
         } catch (e: any) {
             send({
                 type: "agent:warning",
-                message: `Invalid handler for "${name}": ${e.message}`
+                message: `Invalid handler for "${name}": ${e.message}`,
             });
             return [noop, noop];
         }
@@ -383,14 +543,18 @@ class Agent {
 
     private includeModule(pattern: string, plan: TracePlan) {
         const { native } = plan;
-        for (const m of this.getModuleResolver().enumerateMatches(`exports:${pattern}!*`)) {
+        for (const m of this.getModuleResolver().enumerateMatches(
+            `exports:${pattern}!*`
+        )) {
             native.set(m.address.toString(), moduleFunctionTargetFromMatch(m));
         }
     }
 
     private excludeModule(pattern: string, plan: TracePlan) {
         const { native } = plan;
-        for (const m of this.getModuleResolver().enumerateMatches(`exports:${pattern}!*`)) {
+        for (const m of this.getModuleResolver().enumerateMatches(
+            `exports:${pattern}!*`
+        )) {
             native.delete(m.address.toString());
         }
     }
@@ -398,7 +562,9 @@ class Agent {
     private includeFunction(pattern: string, plan: TracePlan) {
         const e = parseModuleFunctionPattern(pattern);
         const { native } = plan;
-        for (const m of this.getModuleResolver().enumerateMatches(`exports:${e.module}!${e.function}`)) {
+        for (const m of this.getModuleResolver().enumerateMatches(
+            `exports:${e.module}!${e.function}`
+        )) {
             native.set(m.address.toString(), moduleFunctionTargetFromMatch(m));
         }
     }
@@ -406,7 +572,9 @@ class Agent {
     private excludeFunction(pattern: string, plan: TracePlan) {
         const e = parseModuleFunctionPattern(pattern);
         const { native } = plan;
-        for (const m of this.getModuleResolver().enumerateMatches(`exports:${e.module}!${e.function}`)) {
+        for (const m of this.getModuleResolver().enumerateMatches(
+            `exports:${e.module}!${e.function}`
+        )) {
             native.delete(m.address.toString());
         }
     }
@@ -414,16 +582,24 @@ class Agent {
     private includeRelativeFunction(pattern: string, plan: TracePlan) {
         const e = parseRelativeFunctionPattern(pattern);
         const address = Module.getBaseAddress(e.module).add(e.offset);
-        plan.native.set(address.toString(), ["c", e.module, `sub_${e.offset.toString(16)}`]);
+        plan.native.set(address.toString(), [
+            "c",
+            e.module,
+            `sub_${e.offset.toString(16)}`,
+        ]);
     }
 
     private includeImports(pattern: string, plan: TracePlan) {
         let matches: ApiResolverMatch[];
         if (pattern === null) {
             const mainModule = Process.enumerateModules()[0].path;
-            matches = this.getModuleResolver().enumerateMatches(`imports:${mainModule}!*`);
+            matches = this.getModuleResolver().enumerateMatches(
+                `imports:${mainModule}!*`
+            );
         } else {
-            matches = this.getModuleResolver().enumerateMatches(`imports:${pattern}!*`);
+            matches = this.getModuleResolver().enumerateMatches(
+                `imports:${pattern}!*`
+            );
         }
 
         const { native } = plan;
@@ -448,14 +624,18 @@ class Agent {
 
     private includeSwiftFunc(pattern: string, plan: TracePlan) {
         const { native } = plan;
-        for (const m of this.getSwiftResolver().enumerateMatches(`functions:${pattern}`)) {
+        for (const m of this.getSwiftResolver().enumerateMatches(
+            `functions:${pattern}`
+        )) {
             native.set(m.address.toString(), swiftFuncTargetFromMatch(m));
         }
     }
 
     private excludeSwiftFunc(pattern: string, plan: TracePlan) {
         const { native } = plan;
-        for (const m of this.getSwiftResolver().enumerateMatches(`functions:${pattern}`)) {
+        for (const m of this.getSwiftResolver().enumerateMatches(
+            `functions:${pattern}`
+        )) {
             native.delete(m.address.toString());
         }
     }
@@ -467,7 +647,7 @@ class Agent {
         for (const group of groups) {
             const { loader } = group;
 
-            const existingGroup = find(existingGroups, candidate => {
+            const existingGroup = find(existingGroups, (candidate) => {
                 const { loader: candidateLoader } = candidate;
                 if (candidateLoader !== null && loader !== null) {
                     return candidateLoader.equals(loader);
@@ -486,18 +666,27 @@ class Agent {
 
                 const existingClass = existingClasses.get(className);
                 if (existingClass === undefined) {
-                    existingClasses.set(className, javaTargetClassFromMatchClass(klass));
+                    existingClasses.set(
+                        className,
+                        javaTargetClassFromMatchClass(klass)
+                    );
                     continue;
                 }
 
                 const { methods: existingMethods } = existingClass;
                 for (const methodName of klass.methods) {
-                    const bareMethodName = javaBareMethodNameFromMethodName(methodName);
+                    const bareMethodName =
+                        javaBareMethodNameFromMethodName(methodName);
                     const existingName = existingMethods.get(bareMethodName);
                     if (existingName === undefined) {
                         existingMethods.set(bareMethodName, methodName);
                     } else {
-                        existingMethods.set(bareMethodName, (methodName.length > existingName.length) ? methodName : existingName);
+                        existingMethods.set(
+                            bareMethodName,
+                            methodName.length > existingName.length
+                                ? methodName
+                                : existingName
+                        );
                     }
                 }
             }
@@ -511,7 +700,7 @@ class Agent {
         for (const group of groups) {
             const { loader } = group;
 
-            const existingGroup = find(existingGroups, candidate => {
+            const existingGroup = find(existingGroups, (candidate) => {
                 const { loader: candidateLoader } = candidate;
                 if (candidateLoader !== null && loader !== null) {
                     return candidateLoader.equals(loader);
@@ -534,7 +723,8 @@ class Agent {
 
                 const { methods: existingMethods } = existingClass;
                 for (const methodName of klass.methods) {
-                    const bareMethodName = javaBareMethodNameFromMethodName(methodName);
+                    const bareMethodName =
+                        javaBareMethodNameFromMethodName(methodName);
                     existingMethods.delete(bareMethodName);
                 }
             }
@@ -544,7 +734,10 @@ class Agent {
     private includeDebugSymbol(pattern: string, plan: TracePlan) {
         const { native } = plan;
         for (const address of DebugSymbol.findFunctionsMatching(pattern)) {
-            native.set(address.toString(), debugSymbolTargetFromAddress(address));
+            native.set(
+                address.toString(),
+                debugSymbolTargetFromAddress(address)
+            );
         }
     }
 
@@ -571,7 +764,7 @@ class Agent {
 
         send({
             type: "events:add",
-            events
+            events,
         });
     };
 
@@ -619,7 +812,7 @@ async function getHandlers(request: HandlerRequest): Promise<HandlerResponse> {
     const pendingScopes = request.scopes.slice().map(({ name, members }) => {
         return {
             name,
-            members: members.slice()
+            members: members.slice(),
         };
     });
     let id = baseId;
@@ -629,7 +822,7 @@ async function getHandlers(request: HandlerRequest): Promise<HandlerResponse> {
             type,
             flavor,
             baseId: id,
-            scopes: curScopes
+            scopes: curScopes,
         };
 
         let size = 0;
@@ -637,7 +830,7 @@ async function getHandlers(request: HandlerRequest): Promise<HandlerResponse> {
             const curMembers: MemberName[] = [];
             curScopes.push({
                 name,
-                members: curMembers
+                members: curMembers,
             });
 
             let exhausted = false;
@@ -658,7 +851,10 @@ async function getHandlers(request: HandlerRequest): Promise<HandlerResponse> {
             }
         }
 
-        while (pendingScopes.length !== 0 && pendingScopes[0].members.length === 0) {
+        while (
+            pendingScopes.length !== 0 &&
+            pendingScopes[0].members.length === 0
+        ) {
             pendingScopes.splice(0, 1);
         }
 
@@ -671,12 +867,12 @@ async function getHandlers(request: HandlerRequest): Promise<HandlerResponse> {
     } while (pendingScopes.length !== 0);
 
     return {
-        scripts
+        scripts,
     };
 }
 
 function receiveResponse<T>(type: string): Promise<T> {
-    return new Promise(resolve => {
+    return new Promise((resolve) => {
         recv(type, (response: T) => {
             resolve(response);
         });
@@ -690,8 +886,19 @@ function moduleFunctionTargetFromMatch(m: ApiResolverMatch): NativeTarget {
 
 function objcMethodTargetFromMatch(m: ApiResolverMatch): NativeTarget {
     const { name } = m;
-    const [className, methodName] = name.substr(2, name.length - 3).split(" ", 2);
-    return ["objc", className, [methodName, name]];
+    const [className, methodName] = name
+        .substr(2, name.length - 3)
+        .split(" ", 2);
+
+    const { method, methodName: methodNameWithPrefix } =
+        runtime.methodFromAPI(m);
+    const { argInfo, retType } = runtime.methdTypeSignatureOf(method.handle);
+    let signature: MethodTypeSignature = {
+        argInfo,
+        retType,
+        sel: `${method.selector}`,
+    };
+    return ["objc", className, [methodName, name, signature]];
 }
 
 function swiftFuncTargetFromMatch(m: ApiResolverMatch): NativeTarget {
@@ -713,13 +920,13 @@ function parseModuleFunctionPattern(pattern: string) {
         m = "*";
         f = tokens[0];
     } else {
-        m = (tokens[0] === "") ? "*" : tokens[0];
-        f = (tokens[1] === "") ? "*" : tokens[1];
+        m = tokens[0] === "" ? "*" : tokens[0];
+        f = tokens[1] === "" ? "*" : tokens[1];
     }
 
     return {
         module: m,
-        function: f
+        function: f,
     };
 }
 
@@ -728,31 +935,48 @@ function parseRelativeFunctionPattern(pattern: string) {
 
     return {
         module: tokens[0],
-        offset: parseInt(tokens[1], 16)
+        offset: parseInt(tokens[1], 16),
     };
 }
 
-function javaTargetGroupFromMatchGroup(group: Java.EnumerateMethodsMatchGroup): JavaTargetGroup {
+function javaTargetGroupFromMatchGroup(
+    group: Java.EnumerateMethodsMatchGroup
+): JavaTargetGroup {
     return {
         loader: group.loader,
         classes: new Map<JavaClassName, JavaTargetClass>(
-            group.classes.map(klass => [klass.name, javaTargetClassFromMatchClass(klass)]))
+            group.classes.map((klass) => [
+                klass.name,
+                javaTargetClassFromMatchClass(klass),
+            ])
+        ),
     };
 }
 
-function javaTargetClassFromMatchClass(klass: Java.EnumerateMethodsMatchClass): JavaTargetClass {
+function javaTargetClassFromMatchClass(
+    klass: Java.EnumerateMethodsMatchClass
+): JavaTargetClass {
     return {
         methods: new Map<JavaMethodName, JavaMethodNameOrSignature>(
-            klass.methods.map(fullName => [javaBareMethodNameFromMethodName(fullName), fullName]))
+            klass.methods.map((fullName) => [
+                javaBareMethodNameFromMethodName(fullName),
+                fullName,
+            ])
+        ),
     };
 }
 
 function javaBareMethodNameFromMethodName(fullName: string) {
     const signatureStart = fullName.indexOf("(");
-    return (signatureStart === -1) ? fullName : fullName.substr(0, signatureStart);
+    return signatureStart === -1
+        ? fullName
+        : fullName.substr(0, signatureStart);
 }
 
-function find<T>(array: T[], predicate: (candidate: T) => boolean): T | undefined {
+function find<T>(
+    array: T[],
+    predicate: (candidate: T) => boolean
+): T | undefined {
     for (const element of array) {
         if (predicate(element)) {
             return element;
@@ -760,8 +984,7 @@ function find<T>(array: T[], predicate: (candidate: T) => boolean): T | undefine
     }
 }
 
-function noop() {
-}
+function noop() {}
 
 interface TraceScriptGlobals {
     stage: Stage;
@@ -795,8 +1018,7 @@ type TraceSpecScope =
     | "objc-method"
     | "swift-func"
     | "java-method"
-    | "debug-symbol"
-    ;
+    | "debug-symbol";
 type TraceSpecPattern = string;
 
 interface TracePlan {
@@ -806,7 +1028,10 @@ interface TracePlan {
 
 type TargetType = "c" | "objc" | "swift" | "java";
 type ScopeName = string;
-type MemberName = string | [string, string]
+type MemberName =
+    | string
+    | [string, string]
+    | [string, string, MethodTypeSignature];
 
 type NativeTargets = Map<NativeId, NativeTarget>;
 type NativeTarget = ["c" | "objc" | "swift", ScopeName, MemberName];
@@ -826,7 +1051,7 @@ type JavaMethodName = string;
 type JavaMethodNameOrSignature = string;
 
 interface HandlerRequest {
-    type: "handlers:get",
+    type: "handlers:get";
     flavor: TargetType;
     baseId: TraceTargetId;
     scopes: HandlerRequestScope[];
@@ -848,8 +1073,16 @@ type Depth = number;
 type Message = string;
 
 type TraceHandler = [TraceEnterHandler, TraceLeaveHandler];
-type TraceEnterHandler = (log: LogHandler, args: any[], state: TraceState) => void;
-type TraceLeaveHandler = (log: LogHandler, retval: any, state: TraceState) => any;
+type TraceEnterHandler = (
+    log: LogHandler,
+    args: any[],
+    state: TraceState
+) => void;
+type TraceLeaveHandler = (
+    log: LogHandler,
+    retval: any,
+    state: TraceState
+) => any;
 
 type CutPoint = ">" | "<";
 
@@ -860,5 +1093,5 @@ const agent = new Agent();
 rpc.exports = {
     init: agent.init.bind(agent),
     dispose: agent.dispose.bind(agent),
-    update: agent.update.bind(agent)
+    update: agent.update.bind(agent),
 };

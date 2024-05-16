@@ -194,6 +194,11 @@ class Agent {
                         this.excludeObjCMethod(pattern, plan);
                     }
                     break;
+                case "objc-property":
+                    if (operation === "exclude") {
+                        this.excludeObjCProperty(pattern, plan);
+                    }
+                    break;
                 case "swift-func":
                     if (operation === "include") {
                         this.includeSwiftFunc(pattern, plan);
@@ -621,6 +626,46 @@ class Agent {
             native.delete(m.address.toString());
         }
     }
+    private excludeObjCProperty(pattern: string, plan: TracePlan) {
+        const { native } = plan;
+        if (!pattern) {
+            return;
+        }
+        const capitalizeFirstLetter = (str: string) => {
+            return str.replace(/^./, (str) => str.toUpperCase());
+        };
+        const propertyMethodNames: Array<string> = [];
+        const classNames = pattern.replace(";", ",").split(",");
+        for (const className of classNames) {
+            const cls = ObjC.classes[className];
+            if (!cls || !cls.alloc) {
+                continue;
+            }
+            try {
+                const inst = cls.alloc().$ivars;
+                const keys = Object.keys(inst);
+                for (const key of keys) {
+                    const name = key.substring(1);
+                    const capitalName = capitalizeFirstLetter(name);
+                    propertyMethodNames.push(`-[${className} ${name}]`);
+                    propertyMethodNames.push(
+                        `-[${className} set${capitalName}:]`
+                    );
+                }
+            } catch (error) {}
+        }
+        const otherIgnoreSet = new Set(["cxx_destruct", "dealloc", "alloc"]);
+        const methodNameSet = new Set(propertyMethodNames);
+        for (const [addr, [type, scope, name]] of native.entries()) {
+            const displayName = typeof name === "string" ? name : name[1];
+            if (
+                methodNameSet.has(displayName) ||
+                otherIgnoreSet.has(displayName)
+            ) {
+                native.delete(addr);
+            }
+        }
+    }
 
     private includeSwiftFunc(pattern: string, plan: TracePlan) {
         const { native } = plan;
@@ -1016,6 +1061,7 @@ type TraceSpecScope =
     | "relative-function"
     | "imports"
     | "objc-method"
+    | "objc-property"
     | "swift-func"
     | "java-method"
     | "debug-symbol";

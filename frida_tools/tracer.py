@@ -127,6 +127,12 @@ def main() -> None:
             )
             parser.add_argument("-o", "--output", help="dump messages to file", metavar="OUTPUT")
             parser.add_argument("--arg", type=int, default=0, help="show arg detail info。 0 none 1 type 2 value")
+            parser.add_argument(
+                "--exclude-objc-property",
+                help="exclude OBJC_PROPERTY_METHOD",
+                metavar="OBJC_PROPERTY_METHOD",
+                type=pb.exclude_objc_property,
+            )
             self._profile_builder = pb
 
         def _usage(self) -> str:
@@ -293,6 +299,11 @@ class TracerProfileBuilder:
     def exclude_objc_method(self, *function_name_globs: str) -> "TracerProfileBuilder":
         for f in function_name_globs:
             self._spec.append(("exclude", "objc-method", f))
+        return self
+
+    def exclude_objc_property(self, *function_name_globs: str) -> "TracerProfileBuilder":
+        for f in function_name_globs:
+            self._spec.append(("exclude", "objc-property", f))
         return self
 
     def include_swift_func(self, *function_name_globs: str) -> "TracerProfileBuilder":

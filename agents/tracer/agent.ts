@@ -190,8 +190,10 @@ class Agent {
                 case "objc-method":
                     if (operation === "include") {
                         this.includeObjCMethod(pattern, plan);
-                    } else {
+                    } else if (operation === "exclude") {
                         this.excludeObjCMethod(pattern, plan);
+                    } else if (operation === "filter") {
+                        this.filterObjCMethod(pattern, plan);
                     }
                     break;
                 case "objc-property":
@@ -613,29 +615,70 @@ class Agent {
         }
     }
 
+    private parseMethodPattern(pattern: string) {
+        if (!pattern) {
+            return [];
+        }
+        return pattern.replace(";", ",").split(",");
+    }
+
     private includeObjCMethod(pattern: string, plan: TracePlan) {
         const { native } = plan;
-        for (const m of this.getObjcResolver().enumerateMatches(pattern)) {
-            native.set(m.address.toString(), objcMethodTargetFromMatch(m));
+        for (const pt of this.parseMethodPattern(pattern)) {
+            for (const m of this.getObjcResolver().enumerateMatches(pt)) {
+                native.set(m.address.toString(), objcMethodTargetFromMatch(m));
+            }
         }
     }
 
     private excludeObjCMethod(pattern: string, plan: TracePlan) {
         const { native } = plan;
-        for (const m of this.getObjcResolver().enumerateMatches(pattern)) {
-            native.delete(m.address.toString());
+        for (const pt of this.parseMethodPattern(pattern)) {
+            for (const m of this.getObjcResolver().enumerateMatches(pt)) {
+                native.delete(m.address.toString());
+            }
         }
     }
+
+    private filterObjCMethod(pattern: string, plan: TracePlan) {
+        const { native } = plan;
+        const regList: Array<RegExp> = [];
+        for (const pt of this.parseMethodPattern(pattern)) {
+            try {
+                const reg = new RegExp(pt, "g");
+                regList.push(reg);
+            } catch (error) {}
+        }
+        if (!regList.length) {
+            return;
+        }
+
+        for (const [addr, [type, scope, name]] of native.entries()) {
+            const displayName = typeof name === "string" ? name : name[1];
+            let matched = false;
+            for (const reg of regList) {
+                if (reg.test(displayName)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                native.delete(addr);
+            }
+        }
+    }
+
     private excludeObjCProperty(pattern: string, plan: TracePlan) {
         const { native } = plan;
         if (!pattern) {
             return;
         }
+        const classNames = pattern.replace(";", ",").split(",");
+
         const capitalizeFirstLetter = (str: string) => {
             return str.replace(/^./, (str) => str.toUpperCase());
         };
         const propertyMethodNames: Array<string> = [];
-        const classNames = pattern.replace(";", ",").split(",");
         for (const className of classNames) {
             const cls = ObjC.classes[className];
             if (!cls || !cls.alloc) {
@@ -1054,7 +1097,7 @@ interface InitScript {
 
 type TraceSpec = TraceSpecItem[];
 type TraceSpecItem = [TraceSpecOperation, TraceSpecScope, TraceSpecPattern];
-type TraceSpecOperation = "include" | "exclude";
+type TraceSpecOperation = "include" | "exclude" | "filter";
 type TraceSpecScope =
     | "module"
     | "function"

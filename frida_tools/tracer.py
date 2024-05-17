@@ -133,6 +133,11 @@ def main() -> None:
                 metavar="OBJC_PROPERTY_METHOD",
                 type=pb.exclude_objc_property,
             )
+            parser.add_argument(
+                "--filter-objc-method",
+                help="filter OBJC_METHOD",
+                type=pb.filter_objc_method,
+            )
             self._profile_builder = pb
 
         def _usage(self) -> str:
@@ -304,6 +309,11 @@ class TracerProfileBuilder:
     def exclude_objc_property(self, *function_name_globs: str) -> "TracerProfileBuilder":
         for f in function_name_globs:
             self._spec.append(("exclude", "objc-property", f))
+        return self
+
+    def filter_objc_method(self, *function_name_globs: str) -> "TracerProfileBuilder":
+        for f in function_name_globs:
+            self._spec.append(("filter", "objc-method", f))
         return self
 
     def include_swift_func(self, *function_name_globs: str) -> "TracerProfileBuilder":
